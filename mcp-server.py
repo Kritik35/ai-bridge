@@ -1,295 +1,373 @@
 # -*- coding: utf-8 -*-
+# AI-Bridge MCP Server v2.0
+# Agents: Gemini CLI · Qwen CLI · Hermes Agent
+# New in v2.0: live status ping, JSONL logging, token savings, async parallel tool
+
 from fastmcp import FastMCP
 import subprocess
+import asyncio
 import os
 import re
+import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
-# Load .env if present (python-dotenv optional)
+# Load .env if present
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
 except ImportError:
     pass
-# Инициализация MCP сервера
+
 mcp = FastMCP("AI Bridge")
 
-# Папка для обмена данными
-SHARED_DIR = Path("C:/Users/almax/ai-bridge/shared")
+# ── Пути ────────────────────────────────────────────────────────────────────
+SHARED_DIR   = Path("C:/Users/almax/ai-bridge/shared")
 SHARED_DIR.mkdir(exist_ok=True)
+LOG_FILE     = SHARED_DIR / "bridge_log.jsonl"
 
-# Пути к Gemini
+NODE_EXE      = r"C:\Program Files\nodejs\node.exe"
 GEMINI_BUNDLE = r"C:\Users\almax\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js"
-GEMINI_PS1    = r"C:\Users\almax\AppData\Roaming\npm\gemini.ps1"
+GEMINI_CONFIG = str(Path(__file__).parent / "gemini-subprocess-config")   # без MCP-серверов
+QWEN_BUNDLE   = r"C:\Users\almax\AppData\Roaming\npm\node_modules\@qwen-code\qwen-code\cli.js"
+HERMES_EXE    = r"C:\Users\almax\hermes-agent\.venv\Scripts\hermes.exe"
+HERMES_DIR    = r"C:\Users\almax\hermes-agent"
 
-# Полный путь к node.exe — чтобы не зависеть от PATH в окружении Qwen
-NODE_EXE = r"C:\Program Files\nodejs\node.exe"
+# ── Logging (Qwen authored) ──────────────────────────────────────────────────
+def _log_call(agent: str, prompt: str, result: str, latency_s: float, error: str = None):
+    """Append one JSON line to bridge_log.jsonl."""
+    prompt_words = len(prompt.split())
+    result_words = len(result.split()) if result else 0
+    record = {
+        "timestamp":            datetime.now(timezone.utc).isoformat(),
+        "agent":                agent,
+        "prompt_words":         prompt_words,
+        "result_words":         result_words,
+        "latency_s":            round(latency_s, 2),
+        "status":               "error" if error else "ok",
+        "error_msg":            error,
+        "tokens_saved_estimate": round(result_words * 1.3),
+    }
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # logging must never break the main flow
 
-# Пути к Qwen CLI (Node.js bundle)
-QWEN_BUNDLE = r"C:\Users\almax\AppData\Roaming\npm\node_modules\@qwen-code\qwen-code\cli.js"
-QWEN_CMD = r"C:\Users\almax\AppData\Roaming\npm\qwen.cmd"
-QWEN_PS1 = r"C:\Users\almax\AppData\Roaming\npm\qwen.ps1"
 
-# Путь к Hermes Agent
-HERMES_EXE = r"C:\Users\almax\hermes-agent\.venv\Scripts\hermes.exe"
-HERMES_DIR = r"C:\Users\almax\hermes-agent"
+def _logged(agent_name: str):
+    """Decorator: wrap a tool function with timing + JSONL logging."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start = time.monotonic()
+            error = None
+            result = ""
+            try:
+                result = func(*args, **kwargs)
+                return result
+            except Exception as e:
+                error = str(e)
+                raise
+            finally:
+                latency = time.monotonic() - start
+                prompt = args[0] if args else kwargs.get("prompt", "")
+                _log_call(agent_name, str(prompt), str(result), latency, error)
+        return wrapper
+    return decorator
 
+# ── Env helpers ──────────────────────────────────────────────────────────────
+def _win_path() -> str:
+    paths = [r"C:\Windows\System32", r"C:\Windows",
+             r"C:\Windows\System32\WindowsPowerShell\v1.0",
+             r"C:\Program Files\Git\bin", r"C:\Program Files\Git\cmd",
+             r"C:\Program Files\nodejs", r"C:\Users\almax\AppData\Roaming\npm"]
+    cur = os.environ.get("PATH", os.environ.get("Path", ""))
+    return ";".join(paths) + ";" + cur if r"Windows\System32" not in cur else cur
+
+# ── 1. get_bridge_status — live ping all 3 agents (Gemini authored) ──────────
 @mcp.tool()
 def get_bridge_status() -> str:
-    """Проверяет статус моста и доступность файлов"""
-    gemini_exists = os.path.exists(GEMINI_BUNDLE) or os.path.exists(GEMINI_PS1)
-    qwen_exists = os.path.exists(QWEN_CMD) or os.path.exists(QWEN_PS1)
-    return f"Bridge Status: ONLINE.\nGemini Found: {gemini_exists}\nQwen Found: {qwen_exists}\nShared Folder: {SHARED_DIR}"
+    """Проверяет статус моста: живой ping всех трёх агентов параллельно."""
 
+    def ping(name: str, cmd: list, timeout: int, extra_env: dict) -> str:
+        env = os.environ.copy()
+        env.update(extra_env)
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                               stdin=subprocess.DEVNULL, env=env, cwd=str(SHARED_DIR))
+            latency = time.monotonic() - t0
+            ok = r.returncode == 0 and r.stdout
+            status = "OK" if ok else "ERROR"
+            return f"  {name}: {status} ({latency:.1f}s)"
+        except subprocess.TimeoutExpired:
+            return f"  {name}: TIMEOUT (>{timeout}s)"
+        except Exception as e:
+            return f"  {name}: ERROR ({e})"
+
+    agents = [
+        ("Gemini", [NODE_EXE, GEMINI_BUNDLE, "-p", "ping", "--skip-trust",
+                    "-m", "gemini-3.1-pro-preview"],
+         30, {"GEMINI_CONFIG_DIR": GEMINI_CONFIG, "NO_COLOR": "1",
+              "CI": "true", "GEMINI_DISABLE_CHECKPOINTING": "true",
+              "PATH": _win_path(), "Path": _win_path()}),
+        ("Qwen", [NODE_EXE, QWEN_BUNDLE, "-p", "ping", "--yolo"],
+         35, {"DASHSCOPE_API_KEY": os.environ.get("DASHSCOPE_API_KEY", ""),
+              "NO_COLOR": "1", "CI": "true",
+              "PATH": _win_path(), "Path": _win_path()}),
+        ("Hermes", [HERMES_EXE, "chat", "-q", "ping", "-Q", "--yolo"],
+         90, {"OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
+              "NO_COLOR": "1", "USERPROFILE": r"C:\Users\almax",
+              "HOME": r"C:\Users\almax", "APPDATA": r"C:\Users\almax\AppData\Roaming"}),
+    ]
+
+    lines = ["AI-Bridge Status:"]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(ping, n, cmd, t, env): n for n, cmd, t, env in agents}
+        results = {futures[f]: f.result() for f in futures}
+    for name, _, _, _ in agents:
+        lines.append(results[name])
+    lines.append(f"  Shared: {SHARED_DIR}")
+    lines.append(f"  Log: {LOG_FILE}")
+    return "\n".join(lines)
+
+# ── 2. run_gemini ────────────────────────────────────────────────────────────
 @mcp.tool()
+@_logged("gemini")
 def run_gemini(prompt: str, use_tools: bool = False) -> str:
-    """Отправить запрос в Gemini CLI.
-    use_tools=False (default): только текстовая генерация, без shell-инструментов — быстро и стабильно.
-    use_tools=True: с shell/поиском (YOLO mode) — для задач где нужен интернет/файлы."""
+    """Gemini CLI. use_tools=False: генерация текста. use_tools=True: shell/поиск (yolo)."""
     if not os.path.exists(GEMINI_BUNDLE):
         return f"Error: Gemini bundle not found at {GEMINI_BUNDLE}"
 
-    # Используем минимальный конфиг без MCP-серверов для subprocess.
-    # Иначе Gemini пытается запустить все 7 серверов из ~/.gemini/settings.json
-    # (filesystem, pdf, excel, context7...) — они зависают и вызывают timeout.
-    _subprocess_config = str(Path(__file__).parent / "gemini-subprocess-config")
-    _model = "gemini-3.1-pro-preview"  # основная модель
-
+    cmd = [NODE_EXE, GEMINI_BUNDLE, "-p", prompt, "--skip-trust",
+           "-m", "gemini-3.1-pro-preview"]
     if use_tools:
-        cmd = [NODE_EXE, GEMINI_BUNDLE, "-p", prompt, "--skip-trust", "--yolo", "-m", _model]
-    else:
-        cmd = [NODE_EXE, GEMINI_BUNDLE, "-p", prompt, "--skip-trust", "-m", _model]
-
-    # PATH: добавляем Windows системные пути + Git (нужен для checkpointing если включён)
-    windows_system_paths = ";".join([
-        r"C:\Windows\System32",
-        r"C:\Windows",
-        r"C:\Windows\System32\WindowsPowerShell\v1.0",
-        r"C:\Program Files\Git\bin",
-        r"C:\Program Files\Git\cmd",
-        r"C:\Program Files\nodejs",
-        r"C:\Users\almax\AppData\Roaming\npm",
-    ])
-    current_path = os.environ.get("PATH", os.environ.get("Path", ""))
-    if r"Windows\System32" not in current_path:
-        current_path = windows_system_paths + ";" + current_path
-    else:
-        # Добавляем Git если его нет
-        if r"Git\bin" not in current_path and r"Git\cmd" not in current_path:
-            current_path = r"C:\Program Files\Git\bin;" + r"C:\Program Files\Git\cmd;" + current_path
+        cmd.append("--yolo")
 
     env = os.environ.copy()
-    env["PATH"] = current_path
-    env["Path"] = current_path
-    env["CI"] = "true"
-    env["NO_COLOR"] = "1"
-    env["FORCE_COLOR"] = "0"
-    env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
-    env["GEMINI_DISABLE_CHECKPOINTING"] = "true"
-    env["GEMINI_CLI_NO_CHECKPOINTING"] = "true"
-    env["CHECKPOINT_ENABLED"] = "false"
-    # Минимальный конфиг без MCP-серверов — ключевое исправление таймаутов!
-    env["GEMINI_CONFIG_DIR"] = _subprocess_config
-    # Не ставим TERM=dumb — это вызывает "basic terminal" предупреждения
-
-    # cwd = shared folder (не git-репозиторий, нет .git)
-    cwd = str(SHARED_DIR)
-
+    env.update({"PATH": _win_path(), "Path": _win_path(),
+                "CI": "true", "NO_COLOR": "1", "FORCE_COLOR": "0",
+                "GEMINI_CLI_TRUST_WORKSPACE": "true",
+                "GEMINI_DISABLE_CHECKPOINTING": "true",
+                "GEMINI_CLI_NO_CHECKPOINTING": "true",
+                "CHECKPOINT_ENABLED": "false",
+                "GEMINI_CONFIG_DIR": GEMINI_CONFIG})
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=120,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            cwd=cwd
-        )
-
-        # Gemini выдаёт UTF-8; убираем ANSI-коды
-        output = result.stdout.decode("utf-8", errors="replace").strip()
-        output = re.sub(r'\x1b\[[0-9;]*[A-Za-zm]', '', output)
-
-        if output:
-            return output
-
-        # stdout пустой — анализируем stderr
-        # stderr может быть в cp1251 на Windows, пробуем оба варианта
+        r = subprocess.run(cmd, capture_output=True, timeout=120,
+                           stdin=subprocess.DEVNULL, env=env, cwd=str(SHARED_DIR))
+        out = re.sub(r'\x1b\[[0-9;]*[A-Za-zm]', '',
+                     r.stdout.decode("utf-8", errors="replace").strip())
+        if out:
+            return out
         try:
-            stderr = result.stderr.decode("cp1251", errors="replace").strip()
+            err = r.stderr.decode("cp1251", errors="replace").strip()
         except Exception:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-
-        # Убираем garbled bytes и оставляем читаемые строки
-        stderr_clean = "\n".join(
-            line for line in stderr.splitlines()
-            if any(c.isascii() and c.isprintable() for c in line)
-        )
-
-        if "429" in stderr or "capacity" in stderr:
-            return "Error: Gemini rate limit. Try again later."
-        if stderr_clean:
-            return f"Gemini no output. Stderr: {stderr_clean[:400]}"
-
-        return "Gemini returned empty response."
-
+            err = r.stderr.decode("utf-8", errors="replace").strip()
+        err_clean = "\n".join(l for l in err.splitlines()
+                              if any(c.isascii() and c.isprintable() for c in l))
+        if "429" in err or "capacity" in err:
+            return "Error: Gemini rate limit. Switch model."
+        return f"Gemini no output. Stderr: {err_clean[:400]}" if err_clean else "Gemini returned empty response."
     except subprocess.TimeoutExpired:
         return "Error: Gemini timeout (>120s)."
-    except FileNotFoundError as e:
-        return f"Error: {e}"
     except Exception as e:
-        return f"Execution Failed: {str(e)}"
+        return f"Execution Failed: {e}"
 
+# ── 3. run_qwen ──────────────────────────────────────────────────────────────
 @mcp.tool()
+@_logged("qwen")
 def run_qwen(prompt: str) -> str:
-    """Отправить запрос в Qwen Code CLI"""
+    """Qwen Code CLI. Пишет файлы напрямую по абсолютному пути."""
     if not os.path.exists(QWEN_BUNDLE):
         return f"Error: Qwen bundle not found at {QWEN_BUNDLE}"
-    if not os.path.exists(NODE_EXE):
-        return f"Error: node.exe not found at {NODE_EXE}"
-
-    # Вызываем напрямую через node.exe (полный путь) — не зависим от PATH
-    cmd = [NODE_EXE, QWEN_BUNDLE, "-p", prompt, "--yolo"]
 
     env = os.environ.copy()
-    env["CI"] = "true"
-    env["NO_COLOR"] = "1"
-    env["FORCE_COLOR"] = "0"
-    # DASHSCOPE_API_KEY из .qwen/settings.json — нужен для аутентификации Qwen CLI
-    env.setdefault("DASHSCOPE_API_KEY", os.environ.get("DASHSCOPE_API_KEY", ""))
-    # Добавляем Git + системные пути (Qwen CLI тоже может нуждаться)
-    cur_path = env.get("PATH", env.get("Path", ""))
+    env.update({"CI": "true", "NO_COLOR": "1", "FORCE_COLOR": "0",
+                "DASHSCOPE_API_KEY": os.environ.get("DASHSCOPE_API_KEY", "")})
+    cur = env.get("PATH", env.get("Path", ""))
     extras = r"C:\Windows\System32;C:\Windows;C:\Program Files\nodejs;C:\Users\almax\AppData\Roaming\npm"
-    if r"Windows\System32" not in cur_path:
-        env["PATH"] = extras + ";" + cur_path
+    if r"Windows\System32" not in cur:
+        env["PATH"] = extras + ";" + cur
         env["Path"] = env["PATH"]
-
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=180,
-            stdin=subprocess.DEVNULL,
-            env=env
-        )
-
-        output = result.stdout.decode("utf-8", errors="replace").strip()
-        output = re.sub(r'\x1b\[[0-9;]*[A-Za-zm]', '', output)
-
-        if output:
-            return output
-
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        if "auth" in stderr.lower() or "login" in stderr.lower():
-            return "Error: Qwen requires authentication. Run 'qwen login' in terminal."
-        if stderr:
-            return f"Qwen CLI Error: {stderr[:400]}"
-
-        return "Qwen returned empty response."
-
+        r = subprocess.run([NODE_EXE, QWEN_BUNDLE, "-p", prompt, "--yolo"],
+                           capture_output=True, timeout=180,
+                           stdin=subprocess.DEVNULL, env=env)
+        out = re.sub(r'\x1b\[[0-9;]*[A-Za-zm]', '',
+                     r.stdout.decode("utf-8", errors="replace").strip())
+        if out:
+            return out
+        err = r.stderr.decode("utf-8", errors="replace").strip()
+        if "auth" in err.lower() or "login" in err.lower():
+            return "Error: Qwen requires authentication."
+        return f"Qwen CLI Error: {err[:400]}" if err else "Qwen returned empty response."
     except subprocess.TimeoutExpired:
         return "Error: Qwen timeout (>180s)."
-    except FileNotFoundError as e:
-        return f"Error: {e}"
     except Exception as e:
-        return f"Execution Failed: {str(e)}"
+        return f"Execution Failed: {e}"
 
+# ── 4. run_hermes ────────────────────────────────────────────────────────────
 @mcp.tool()
+@_logged("hermes")
 def run_hermes(prompt: str) -> str:
-    """Отправить запрос в Hermes Agent (OpenRouter / nemotron).
-    Hermes имеет доступ к shell, файлам, памяти и skills."""
+    """Hermes Agent (OpenRouter). Многошаговые задачи, memory, shell."""
     if not os.path.exists(HERMES_EXE):
-        return f"Error: Hermes executable not found at {HERMES_EXE}"
-
-    cmd = [HERMES_EXE, "chat", "-q", prompt, "-Q", "--yolo"]
+        return f"Error: Hermes not found at {HERMES_EXE}"
 
     env = os.environ.copy()
-    env["OPENROUTER_API_KEY"] = os.environ.get("OPENROUTER_API_KEY", "")
-    env["NO_COLOR"] = "1"
-    env["FORCE_COLOR"] = "0"
-    env["USERPROFILE"] = r"C:\Users\almax"
-    env["HOME"] = r"C:\Users\almax"
-    env["APPDATA"] = r"C:\Users\almax\AppData\Roaming"
+    env.update({"OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
+                "NO_COLOR": "1", "FORCE_COLOR": "0",
+                "USERPROFILE": r"C:\Users\almax", "HOME": r"C:\Users\almax",
+                "APPDATA": r"C:\Users\almax\AppData\Roaming"})
+    try:
+        r = subprocess.run([HERMES_EXE, "chat", "-q", prompt, "-Q", "--yolo"],
+                           capture_output=True, timeout=300,
+                           stdin=subprocess.DEVNULL, env=env, cwd=HERMES_DIR)
+        out = re.sub(r'\x1b\[[0-9;]*[A-Za-zm]', '',
+                     r.stdout.decode("utf-8", errors="replace").strip())
+        if out:
+            return out
+        err = r.stderr.decode("utf-8", errors="replace").strip()
+        return f"Hermes stderr: {err[:400]}" if err else "Hermes returned empty response."
+    except subprocess.TimeoutExpired:
+        return "Error: Hermes timeout (>300s). Cold start ~50s."
+    except Exception as e:
+        return f"Execution Failed: {e}"
+
+# ── 5. run_parallel_agents — asyncio (Gemini + Hermes authored) ──────────────
+@mcp.tool()
+async def run_parallel_agents(tasks_json: str) -> str:
+    """Запустить несколько агентов параллельно через asyncio.
+    tasks_json: JSON-массив задач, например:
+    [{"agent":"gemini","prompt":"что такое MCP?"},{"agent":"qwen","prompt":"ping"}]
+    Возвращает JSON-массив результатов с полями: agent, result, latency_s, status."""
+
+    _dispatch = {"gemini": run_gemini, "qwen": run_qwen, "hermes": run_hermes}
+
+    async def call_one(task: dict) -> dict:
+        agent = task.get("agent", "").lower()
+        prompt = task.get("prompt", "")
+        fn = _dispatch.get(agent)
+        if not fn:
+            return {"agent": agent, "result": f"Unknown agent: {agent}",
+                    "latency_s": 0.0, "status": "error"}
+        t0 = time.monotonic()
+        try:
+            # run_gemini/run_qwen/run_hermes — синхронные; запускаем в thread
+            result = await asyncio.to_thread(fn, prompt)
+            latency = round(time.monotonic() - t0, 2)
+            status = "error" if result.startswith("Error") else "ok"
+            return {"agent": agent, "result": result, "latency_s": latency, "status": status}
+        except Exception as e:
+            return {"agent": agent, "result": str(e),
+                    "latency_s": round(time.monotonic() - t0, 2), "status": "error"}
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=300,  # Hermes стартует ~50s + генерация; запас 5 мин
-            stdin=subprocess.DEVNULL,
-            env=env,
-            cwd=HERMES_DIR,
+        tasks = json.loads(tasks_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON: {e}"})
+
+    results = await asyncio.gather(*[call_one(t) for t in tasks])
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+# ── 6. get_bridge_log — статистика логов ────────────────────────────────────
+@mcp.tool()
+def get_bridge_log(last_n: int = 20) -> str:
+    """Показать последние N записей лога + суммарную статистику по агентам."""
+    if not LOG_FILE.exists():
+        return "Log file not found. No calls logged yet."
+    lines = LOG_FILE.read_text(encoding="utf-8").strip().splitlines()
+    if not lines:
+        return "Log is empty."
+
+    records = []
+    for l in lines:
+        try:
+            records.append(json.loads(l))
+        except Exception:
+            pass
+
+    # Статистика
+    stats: dict = {}
+    for r in records:
+        a = r.get("agent", "?")
+        if a not in stats:
+            stats[a] = {"calls": 0, "ok": 0, "errors": 0,
+                        "total_latency": 0.0, "tokens_saved": 0}
+        stats[a]["calls"] += 1
+        stats[a]["ok" if r.get("status") == "ok" else "errors"] += 1
+        stats[a]["total_latency"] += r.get("latency_s", 0)
+        stats[a]["tokens_saved"] += r.get("tokens_saved_estimate", 0)
+
+    lines_out = [f"=== AI-Bridge Log (total {len(records)} calls) ===\n"]
+    lines_out.append("--- Stats per agent ---")
+    for agent, s in sorted(stats.items()):
+        avg = s["total_latency"] / s["calls"] if s["calls"] else 0
+        lines_out.append(
+            f"  {agent}: {s['calls']} calls | {s['ok']} ok / {s['errors']} err "
+            f"| avg {avg:.1f}s | ~{s['tokens_saved']} tokens saved"
         )
 
-        output = result.stdout.decode("utf-8", errors="replace").strip()
-        output = re.sub(r'\x1b\[[0-9;]*[A-Za-zm]', '', output)
+    lines_out.append(f"\n--- Last {last_n} calls ---")
+    for r in records[-last_n:]:
+        ts = r.get("timestamp", "")[:19].replace("T", " ")
+        lines_out.append(
+            f"  [{ts}] {r.get('agent','?'):8s} "
+            f"{r.get('status','?'):8s} "
+            f"{r.get('latency_s',0):5.1f}s "
+            f"prompt={r.get('prompt_words',0)}w "
+            f"result={r.get('result_words',0)}w "
+            f"~{r.get('tokens_saved_estimate',0)}tok"
+        )
+    return "\n".join(lines_out)
 
-        if output:
-            return output
-
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        if stderr:
-            return f"Hermes stderr: {stderr[:400]}"
-        return "Hermes returned empty response."
-
-    except subprocess.TimeoutExpired:
-        return "Error: Hermes timeout (>300s). Hermes startup takes ~50s — try a shorter prompt or switch model in cli-config.yaml."
-    except FileNotFoundError as e:
-        return f"Error: {e}"
-    except Exception as e:
-        return f"Execution Failed: {str(e)}"
-
+# ── 7. Shared file tools ─────────────────────────────────────────────────────
 @mcp.tool()
 def save_to_shared(filename: str, content: str) -> str:
-    """Сохранить текст в файл для обмена с другими ИИ"""
+    """Сохранить текст в файл для обмена с другими агентами."""
     try:
-        filepath = SHARED_DIR / filename
-        filepath.write_text(content, encoding='utf-8')
-        return f"Saved successfully to {filepath}"
+        (SHARED_DIR / filename).write_text(content, encoding="utf-8")
+        return f"Saved to {SHARED_DIR / filename}"
     except Exception as e:
-        return f"Save Error: {str(e)}"
+        return f"Save Error: {e}"
 
 @mcp.tool()
 def read_from_shared(filename: str) -> str:
-    """Прочитать текст из общей папки"""
-    filepath = SHARED_DIR / filename
-    if filepath.exists():
+    """Прочитать файл из shared папки."""
+    fp = SHARED_DIR / filename
+    if fp.exists():
         try:
-            return filepath.read_text(encoding='utf-8')
+            return fp.read_text(encoding="utf-8")
         except Exception as e:
-            return f"Read Error: {str(e)}"
-    return f"File {filename} not found in shared folder."
+            return f"Read Error: {e}"
+    return f"File {filename} not found."
 
 @mcp.tool()
 def list_shared() -> str:
-    """Показать все файлы в общей папке (для координации между агентами)"""
+    """Список файлов в shared папке."""
     try:
-        files = list(SHARED_DIR.iterdir())
+        files = sorted(SHARED_DIR.iterdir())
         if not files:
             return "Shared folder is empty."
-        result = []
-        for f in sorted(files):
-            size = f.stat().st_size
-            result.append(f"{f.name} ({size} bytes)")
-        return "Files in shared folder:\n" + "\n".join(result)
+        return "Files:\n" + "\n".join(f"  {f.name} ({f.stat().st_size}b)" for f in files)
     except Exception as e:
-        return f"List Error: {str(e)}"
+        return f"List Error: {e}"
 
 @mcp.tool()
 def task_for_claude(task: str, from_agent: str = "unknown") -> str:
-    """Отправить задачу Клоду (Claude). Задача сохраняется в shared/claude_inbox.txt.
-    Claude периодически проверяет этот файл.
-    from_agent: имя агента-отправителя (gemini/qwen/qwen_chat/etc)"""
-    import datetime
+    """Асинхронная очередь задач для Claude через claude_inbox.txt."""
     try:
         inbox = SHARED_DIR / "claude_inbox.txt"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        entry = f"\n[{timestamp}] FROM: {from_agent}\n{task}\n---\n"
-        # Append to inbox
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(inbox, "a", encoding="utf-8") as f:
-            f.write(entry)
-        return f"Task saved to Claude inbox. Claude will process it when available.\nFile: {inbox}"
+            f.write(f"\n[{ts}] FROM: {from_agent}\n{task}\n---\n")
+        return f"Task queued for Claude. File: {inbox}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: {e}"
 
 if __name__ == "__main__":
     mcp.run()
