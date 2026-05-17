@@ -1,220 +1,129 @@
-# 🌉 AI-Bridge MCP
+# 🌉 AI-Bridge MCP v2.0
 
-> Единый мост для многоагентной AI-системы на базе Model Context Protocol (MCP)
+Multi-agent bridge via Model Context Protocol. One Python file connects Claude Desktop, Qwen Chat, Gemini CLI, Qwen CLI and Hermes into a coordinated AI system.
 
-**AI-Bridge** — MCP-сервер на FastMCP, который позволяет пяти AI-агентам вызывать друг друга, обмениваться данными и строить многоагентные пайплайны. Один Python-файл (~300 строк) без баз данных и сетевых серверов.
-
----
-
-## Архитектура
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
-│         ОРКЕСТРАТОРЫ (первичные)            │
-│   Claude Desktop        Qwen Chat           │
-└────────────────┬────────────────────────────┘
-                 │ run_gemini / run_qwen / run_hermes
-        ┌────────▼────────┐
-        │  AI-BRIDGE MCP  │  ← mcp-server.py (FastMCP)
-        │  stdio transport│  ← 8 инструментов
-        └──┬──────┬────┬──┘
-           ▼      ▼    ▼
-      Gemini   Qwen   Hermes
-       CLI      CLI   Agent
-    (субагенты-исполнители)
+│    ORCHESTRATORS                            │
+│    Claude Desktop        Qwen Chat          │
+└──────────────┬──────────────────────────────┘
+               │ 10 MCP tools
+      ┌────────▼────────┐
+      │  AI-BRIDGE MCP  │  mcp-server.py · FastMCP · stdio
+      │  JSONL logging  │  parallel ping · asyncio runner
+      └──┬──────┬────┬──┘
+         ▼      ▼    ▼
+    Gemini   Qwen   Hermes
+     CLI      CLI   Agent
+   (subagents / optional orchestrators)
 ```
 
-| Агент | Роль | Вызов |
-|-------|------|-------|
-| Claude Desktop | Оркестратор | сам вызывает bridge |
-| Qwen Chat | Оркестратор | сам вызывает bridge |
-| Gemini CLI | Субагент | `run_gemini()` |
-| Qwen CLI | Субагент | `run_qwen()` |
-| Hermes Agent | Субагент | `run_hermes()` |
+| Agent | Role | Avg latency |
+|-------|------|-------------|
+| Claude Desktop | Primary orchestrator | — |
+| Qwen Chat | Primary orchestrator | — |
+| Gemini CLI | Subagent | ~25s |
+| Qwen CLI | Subagent | ~30s |
+| Hermes Agent | Subagent | ~47s |
 
-> Каждый агент может опционально стать оркестратором — делегировать задачи другим.
+## 10 MCP Tools
 
----
+| Tool | Description |
+|------|-------------|
+| `get_bridge_status` | Parallel live ping all 3 agents (ThreadPoolExecutor) |
+| `run_gemini` | Gemini CLI · `use_tools=False/True` · timeout 120s |
+| `run_qwen` | Qwen Code CLI · writes files by absolute path · timeout 180s |
+| `run_hermes` | Hermes Agent · shell + memory + skills · timeout 300s |
+| `run_parallel_agents` | Run multiple agents concurrently via `asyncio.to_thread` |
+| `get_bridge_log` | JSONL stats: calls / errors / avg latency / tokens saved |
+| `save_to_shared` | Write file to shared folder |
+| `read_from_shared` | Read file from shared folder |
+| `list_shared` | List shared folder contents |
+| `task_for_claude` | Async task queue → `claude_inbox.txt` |
 
-## Инструменты (8 штук)
+## Delegation Matrix
 
-| Инструмент | Параметры | Назначение |
-|------------|-----------|-----------|
-| `get_bridge_status` | — | Проверка работоспособности |
-| `run_gemini` | `prompt`, `use_tools=False` | Вызов Google Gemini CLI |
-| `run_qwen` | `prompt` | Вызов Qwen Code CLI |
-| `run_hermes` | `prompt` | Вызов Hermes Agent |
-| `save_to_shared` | `filename`, `content` | Запись в shared папку |
-| `read_from_shared` | `filename` | Чтение из shared папки |
-| `list_shared` | — | Список файлов shared |
-| `task_for_claude` | `task`, `from_agent` | Асинхронная задача для Claude |
+| Task | Agent |
+|------|-------|
+| Code / text generation | `run_gemini(use_tools=False)` |
+| Shell / pip / logs | `run_gemini(use_tools=True)` |
+| Write files | `run_qwen()` with absolute path |
+| Multi-step + memory | `run_hermes()` |
+| Parallel tasks | `run_parallel_agents()` |
 
-### Матрица делегирования
-
-| Задача | Агент |
-|--------|-------|
-| Генерация кода / текста | `run_gemini(use_tools=False)` |
-| Shell / pip / установка | `run_gemini(use_tools=True)` |
-| Запись файлов | `run_qwen()` — с абсолютным путём |
-| Многошаговые + memory | `run_hermes()` |
-| Поиск в интернете | Gemini или Hermes |
-
----
-
-## Установка
-
-### Требования
-- Python 3.11+
-- [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`npm install -g @google/gemini-cli`)
-- [Qwen Code CLI](https://github.com/QwenLM/qwen-code) (`npm install -g @qwen-code/qwen-code`)
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) (опционально)
-
-### Быстрый старт
+## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-bridge.git
+git clone https://github.com/Kritik35/ai-bridge.git
 cd ai-bridge
 pip install -r requirements.txt
-```
-
-Скопируйте `.env.example` в `.env` и заполните ключи:
-```bash
 cp .env.example .env
+# Fill DASHSCOPE_API_KEY and OPENROUTER_API_KEY in .env
 ```
 
-```env
-DASHSCOPE_API_KEY=your_dashscope_key   # Qwen CLI
-OPENROUTER_API_KEY=your_openrouter_key # Hermes Agent
-```
+Set absolute paths in `mcp-server.py` for your machine (`NODE_EXE`, `GEMINI_BUNDLE`, `QWEN_BUNDLE`, `HERMES_EXE`).
 
-### Настройте пути в `mcp-server.py`
+## Client Configs
 
-Найдите блок с константами и укажите пути к вашим CLI-инструментам:
-
-```python
-# Путь к node.exe
-NODE_EXE = r"C:\Program Files\nodejs\node.exe"
-
-# Пути к Gemini CLI
-GEMINI_BUNDLE = r"C:\Users\USERNAME\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js"
-
-# Пути к Qwen CLI
-QWEN_BUNDLE = r"C:\Users\USERNAME\AppData\Roaming\npm\node_modules\@qwen-code\qwen-code\cli.js"
-
-# Путь к Hermes
-HERMES_EXE = r"C:\Users\USERNAME\hermes-agent\.venv\Scripts\hermes.exe"
-```
-
----
-
-## Подключение к клиентам
-
-### Claude Desktop
-Добавьте в `%APPDATA%\Claude\claude_desktop_config.json`:
+**Claude Desktop** — `%APPDATA%\Claude\claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
-    "ai-bridge": {
-      "command": "python",
-      "args": ["C:\\path\\to\\ai-bridge\\mcp-server.py"]
-    }
+    "ai-bridge": {"command": "python", "args": ["C:\\path\\to\\ai-bridge\\mcp-server.py"]}
   }
 }
 ```
 
-### Gemini CLI
-Добавьте в `~/.gemini/settings.json`:
+**Gemini CLI** — `~/.gemini/settings.json`
 ```json
 {
   "mcpServers": {
-    "ai-bridge": {
-      "command": "python",
-      "args": ["C:\\path\\to\\ai-bridge\\mcp-server.py"]
-    }
+    "ai-bridge": {"command": "python", "args": ["C:\\path\\to\\ai-bridge\\mcp-server.py"]}
   },
-  "general": { "checkpointing": { "enabled": false } }
+  "general": {"checkpointing": {"enabled": false}}
 }
 ```
 
-### Qwen Chat (Desktop)
-В настройках MCP добавьте сервер `ai-bridge` с командой `python` и путём к `mcp-server.py`.
-
-### Cline (VS Code)
-Добавьте в `cline_mcp_settings.json`:
+**Cline (VS Code)** — `cline_mcp_settings.json`
 ```json
 {
   "mcpServers": {
-    "ai-bridge": {
-      "command": "python",
-      "args": ["C:\\path\\to\\ai-bridge\\mcp-server.py"]
-    }
+    "ai-bridge": {"command": "python", "args": ["C:\\path\\to\\ai-bridge\\mcp-server.py"]}
   }
 }
 ```
 
----
+## Models & Fallbacks
 
-## Shared папка
-
-Файловая шина для обмена данными между агентами:
-
-```
-shared/
-├── AI_BRIDGE_MASTER.md        ← единая инструкция для всех агентов
-├── CLAUDE_DELEGATION_RULES.md ← правила для Claude Desktop
-├── QWEN_CHAT_INSTRUCTIONS.md  ← правила для Qwen Chat
-├── GEMINI_INSTRUCTIONS.md     ← правила для Gemini CLI
-├── QWEN_CLI_INSTRUCTIONS.md   ← правила для Qwen CLI
-├── HERMES_INSTRUCTIONS.md     ← правила для Hermes
-└── claude_inbox.txt           ← асинхронная очередь задач для Claude
-```
-
----
-
-## Технические детали
-
-**Транспорт: stdio** — MCP использует stdin/stdout как протокол. Любой `print()` до `mcp.run()` ломает соединение.
-
-**PATH в subprocess** — при запуске через MCP subprocess наследует пустой PATH. Решение: абсолютные пути к `node.exe` и CLI-бандлам.
-
-**Gemini Checkpointing** — Gemini CLI по умолчанию пытается использовать git. Отключается через `GEMINI_DISABLE_CHECKPOINTING=true` и `cwd` без `.git`.
-
-**Hermes cold start** — ~50 сек на запуск Python-окружения. Timeout в `run_hermes()` установлен в 300 сек.
-
----
-
-## Провайдеры и модели
-
-### Gemini CLI — Google AI (бесплатно)
+**Gemini CLI** (Google AI, free):
 `gemini-3.1-pro-preview` → `gemini-3-flash-preview` → `gemini-3.1-flash-lite-preview`
 
-### Qwen CLI — Alibaba DashScope
+**Qwen CLI** (Alibaba DashScope):
 `qwen3.6-plus` → `deepseek-v4-pro` → `glm-5.1` → `deepseek-v4-flash`
 
-### Hermes — OpenRouter (free tier)
+**Hermes** (OpenRouter free tier):
 `openai/gpt-oss-120b:free` → `nvidia/nemotron-3-super-120b-a12b:free`
 
----
+## Key Technical Details
 
-## Структура проекта
+| Issue | Fix |
+|-------|-----|
+| Gemini loads 7 MCP servers on start → timeout | `GEMINI_CONFIG_DIR` → minimal config with empty `mcpServers` |
+| subprocess has empty PATH | Hardcoded absolute paths to `node.exe` and CLI bundles |
+| Hermes cold start ~50s | `chat -q "prompt" -Q --yolo` · timeout 300s |
+| Windows encoding issues | UTF-8 + cp1251 fallback · ANSI codes stripped |
+| Agents block each other | `ThreadPoolExecutor` for status · `asyncio.to_thread` for parallel |
 
-```
-ai-bridge/
-├── mcp-server.py       ← основной MCP-сервер
-├── requirements.txt    ← зависимости Python
-├── .env.example        ← шаблон переменных окружения
-├── Project.md          ← полная проектная документация
-├── README.md           ← этот файл
-└── shared/             ← инструкции и шина данных
-    └── *.md
-```
+## What's New in v2.0
 
----
+- **`get_bridge_status`**: live parallel ping (ThreadPoolExecutor) instead of file checks
+- **`run_parallel_agents`**: asyncio concurrent multi-agent execution
+- **`get_bridge_log`**: per-agent stats + token savings estimate
+- **`@_logged` decorator**: automatic JSONL logging on all agent tools
+- **Gemini timeout fix**: >120s → ~25s via `GEMINI_CONFIG_DIR`
 
-## Лицензия
+## License
 
-MIT
-
----
-
-*Создано в рамках разработки локального RAG-ассистента для BIM-отдела*
+MIT — [github.com/Kritik35/ai-bridge](https://github.com/Kritik35/ai-bridge)

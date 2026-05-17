@@ -1,0 +1,11 @@
+{"timestamp": "2026-05-17T17:25:39.180386+00:00", "agent": "gemini", "prompt_words": 4, "result_words": 7, "latency_s": 14.5, "status": "ok", "error_msg": null, "tokens_saved_estimate": 9}
+{"timestamp": "2026-05-17T17:25:39.181144+00:00", "agent": "qwen", "prompt_words": 1, "result_words": 2, "latency_s": 21.0, "status": "ok", "error_msg": null, "tokens_saved_estimate": 3}
+{"timestamp": "2026-05-17T17:25:39.181501+00:00", "agent": "hermes", "prompt_words": 1, "result_words": 1, "latency_s": 56.7, "status": "ok", "error_msg": null, "tokens_saved_estimate": 1}
+{"timestamp": "2026-05-17T17:30:04.095342+00:00", "agent": "gemini", "prompt_words": 4, "result_words": 90, "latency_s": 31.87, "status": "ok", "error_msg": null, "tokens_saved_estimate": 117}
+{"timestamp": "2026-05-17T20:05:15.679611+00:00", "agent": "gemini", "prompt_words": 1, "result_words": 7, "latency_s": 26.16, "status": "ok", "error_msg": null, "tokens_saved_estimate": 9}
+{"timestamp": "2026-05-17T20:05:35.483222+00:00", "agent": "qwen", "prompt_words": 1, "result_words": 8, "latency_s": 45.96, "status": "ok", "error_msg": null, "tokens_saved_estimate": 10}
+{"timestamp": "2026-05-17T20:10:08.834495+00:00", "agent": "hermes", "prompt_words": 7, "result_words": 1, "latency_s": 22.58, "status": "ok", "error_msg": null, "tokens_saved_estimate": 1}
+{"timestamp": "2026-05-17T20:10:12.931264+00:00", "agent": "gemini", "prompt_words": 5, "result_words": 1, "latency_s": 26.68, "status": "ok", "error_msg": null, "tokens_saved_estimate": 1}
+{"timestamp": "2026-05-17T20:10:18.699887+00:00", "agent": "qwen", "prompt_words": 5, "result_words": 1, "latency_s": 32.45, "status": "ok", "error_msg": null, "tokens_saved_estimate": 1}
+{"timestamp": "2026-05-17T20:27:23.666398+00:00", "agent": "gemini", "prompt_words": 94, "result_words": 344, "latency_s": 44.3, "status": "ok", "error_msg": null, "tokens_saved_estimate": 447}
+{"timestamp": "2026-05-17T20:28:37.161507+00:00", "agent": "gemini", "prompt_words": 101, "result_words": 691, "latency_s": 60.75, "status": "ok", "error_msg": null, "tokens_saved_estimate": 898}
