@@ -49,18 +49,11 @@ def run_gemini(prompt: str, use_tools: bool = False) -> str:
     if not os.path.exists(GEMINI_BUNDLE):
         return f"Error: Gemini bundle not found at {GEMINI_BUNDLE}"
 
-    # Базовая команда — полный путь к node.exe, без зависимости от PATH
-    # --allowed-mcp-server-names "": не запускать MCP серверы из settings.json
-    # (они зависают в subprocess-режиме и замедляют старт)
-    # Модель берём из settings.json но передаём явно через флаг для надёжности
-    import json as _json
-    _settings_path = Path(r"C:\Users\almax\.gemini\settings.json")
-    _model = "gemini-3-flash-preview"  # fallback
-    try:
-        _cfg = _json.loads(_settings_path.read_text(encoding="utf-8"))
-        _model = _cfg.get("model", {}).get("name", _model)
-    except Exception:
-        pass
+    # Используем минимальный конфиг без MCP-серверов для subprocess.
+    # Иначе Gemini пытается запустить все 7 серверов из ~/.gemini/settings.json
+    # (filesystem, pdf, excel, context7...) — они зависают и вызывают timeout.
+    _subprocess_config = str(Path(__file__).parent / "gemini-subprocess-config")
+    _model = "gemini-3.1-pro-preview"  # основная модель
 
     if use_tools:
         cmd = [NODE_EXE, GEMINI_BUNDLE, "-p", prompt, "--skip-trust", "--yolo", "-m", _model]
@@ -92,9 +85,11 @@ def run_gemini(prompt: str, use_tools: bool = False) -> str:
     env["NO_COLOR"] = "1"
     env["FORCE_COLOR"] = "0"
     env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
-    env["GEMINI_DISABLE_CHECKPOINTING"] = "true"   # нет Git в subprocess
-    env["GEMINI_CLI_NO_CHECKPOINTING"] = "true"    # альтернативное имя
+    env["GEMINI_DISABLE_CHECKPOINTING"] = "true"
+    env["GEMINI_CLI_NO_CHECKPOINTING"] = "true"
     env["CHECKPOINT_ENABLED"] = "false"
+    # Минимальный конфиг без MCP-серверов — ключевое исправление таймаутов!
+    env["GEMINI_CONFIG_DIR"] = _subprocess_config
     # Не ставим TERM=dumb — это вызывает "basic terminal" предупреждения
 
     # cwd = shared folder (не git-репозиторий, нет .git)
