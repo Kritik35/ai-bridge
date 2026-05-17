@@ -116,7 +116,7 @@ def get_bridge_status() -> str:
               "CI": "true", "GEMINI_DISABLE_CHECKPOINTING": "true",
               "PATH": _win_path(), "Path": _win_path()}),
         ("Qwen", [NODE_EXE, QWEN_BUNDLE, "-p", "ping", "--yolo"],
-         35, {"DASHSCOPE_API_KEY": os.environ.get("DASHSCOPE_API_KEY", ""),
+         60, {"DASHSCOPE_API_KEY": os.environ.get("DASHSCOPE_API_KEY", ""),
               "NO_COLOR": "1", "CI": "true",
               "PATH": _win_path(), "Path": _win_path()}),
         ("Hermes", [HERMES_EXE, "chat", "-q", "ping", "-Q", "--yolo"],
