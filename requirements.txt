@@ -1,0 +1,18 @@
+# AI Bridge MCP Server Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core MCP framework
+fastmcp>=0.4.0
+
+# HTTP client for potential API calls (optional)
+httpx>=0.27.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Logging enhancement (optional)
+rich>=13.0.0
+
+# For future async support
+anyio>=4.0.0

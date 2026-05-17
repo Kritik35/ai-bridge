@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Shared folder — личные данные и промежуточные результаты
+shared/*.txt
+shared/*.json
+shared/*.py
+shared/*.ps1
+
+# Logs
+*.log
+bridge.log
+
+# OS
+.DS_Store
+Thumbs.db
